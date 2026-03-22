@@ -11,6 +11,7 @@ Usage:
 
 import os
 import json
+import re
 import uuid
 import asyncio
 import tempfile
@@ -205,18 +206,18 @@ def extract_product_data(row, has_header):
 
 async def call_claude(client, model, system_prompt, product_data):
     """Один виклик Claude API для генерації title + description."""
-    user_message = f"""Згенеруй оптимізований title і description для цього товару:
+    user_message = f"""Згенеруй оптимізований title і description для цього товару.
 
-ID: {product_data['id']}
 Поточний title: {product_data['title']}
-Поточний description: {product_data['description'][:300]}
+Опис: {product_data['description'][:300]}
 Product type: {product_data['product_type']}
 Brand: {product_data['brand']}
 Gender: {product_data['gender']}
 Color: {product_data['color']}
 Material: {product_data['material']}
 
-Відповідай ТІЛЬКИ валідним JSON: {{"title": "...", "description": "..."}}"""
+ВАЖЛИВО: Відповідай ВИКЛЮЧНО валідним JSON без будь-якого іншого тексту.
+Формат: {{"title": "новий заголовок", "description": "новий опис"}}"""
 
     try:
         response = client.messages.create(
@@ -228,16 +229,49 @@ Material: {product_data['material']}
         )
 
         text = response.content[0].text.strip()
-        # Parse JSON from response
-        if text.startswith('```'):
-            text = text.split('```')[1]
-            if text.startswith('json'):
-                text = text[4:]
-        result = json.loads(text)
-        return result.get("title", ""), result.get("description", "")
 
-    except json.JSONDecodeError:
-        return None, None
+        # Strategy 1: direct JSON parse
+        try:
+            result = json.loads(text)
+            if "title" in result:
+                return result["title"], result.get("description", "")
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: extract from ```json ... ``` blocks
+        code_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if code_block:
+            try:
+                result = json.loads(code_block.group(1))
+                if "title" in result:
+                    return result["title"], result.get("description", "")
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: find first { ... } in text
+        brace_match = re.search(r'\{[^{}]*"title"[^{}]*\}', text, re.DOTALL)
+        if brace_match:
+            try:
+                result = json.loads(brace_match.group(0))
+                if "title" in result:
+                    return result["title"], result.get("description", "")
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 4: find nested JSON (with inner braces in description)
+        first_brace = text.find('{')
+        last_brace = text.rfind('}')
+        if first_brace != -1 and last_brace > first_brace:
+            try:
+                result = json.loads(text[first_brace:last_brace + 1])
+                if "title" in result:
+                    return result["title"], result.get("description", "")
+            except json.JSONDecodeError:
+                pass
+
+        # All strategies failed
+        return None, f"Could not parse response: {text[:100]}"
+
     except Exception as e:
         return None, str(e)
 
